@@ -1,0 +1,13 @@
+diff --git a/configs/lam_audio2exp_config_streaming.py b/configs/lam_audio2exp_config_streaming.py
+index 3f44b92..fdd0d42 100644
+--- a/configs/lam_audio2exp_config_streaming.py
++++ b/configs/lam_audio2exp_config_streaming.py
+@@ -15,7 +15,7 @@ evaluate = True  # evaluate after each epoch training process
+ test_only = False  # test process
+ 
+ seed = None  # train process will init a random seed and record
+-save_path = "exp/audio2exp"
++save_path = "runtime_exp/audio2exp"
+ num_worker = 16  # total worker in all gpu
+ batch_size = 16  # total batch size in all gpu
+ batch_size_val = None  # auto adapt to bs 1 for each gpu

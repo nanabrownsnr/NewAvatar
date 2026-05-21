@@ -1,0 +1,293 @@
+diff --git a/src/renderer/src/handlers/avatarHandler.ts b/src/renderer/src/handlers/avatarHandler.ts
+index f6e6ee9..b4ddb48 100644
+--- a/src/renderer/src/handlers/avatarHandler.ts
++++ b/src/renderer/src/handlers/avatarHandler.ts
+@@ -285,10 +285,7 @@ export class AvatarHandler extends EventEmitter {
+           this.interrupt(false)
+           break
+         case 'stream_cancel':
+-          console.log('stream_cancel  interrupt', payload)
+-          if (payload.stream_type === 'client_playback') {
+-            this.interrupt(false)
+-          }
++          console.log('stream_cancel', payload)
+           break
+         default:
+           break
+diff --git a/src/renderer/src/helpers/player.ts b/src/renderer/src/helpers/player.ts
+index 8bd6fb2..3030e22 100644
+--- a/src/renderer/src/helpers/player.ts
++++ b/src/renderer/src/helpers/player.ts
+@@ -60,6 +60,8 @@ export class Player {
+ 
+   _firstStartRelativeTime?: number
+   _firstStartAbsoluteTime?: number
++  _scheduledSources = 0
++  _endedSources = 0
+ 
+   constructor(option: IOption, ee: EventEmitter) {
+     this.ee = ee
+@@ -106,16 +108,21 @@ export class Player {
+       this.audioCtx.resume()
+     }
+     const { data, end_of_batch } = samples
+-    if (this.bufferSource) {
+-      this.bufferSource.onended = () => {}
+-    }
+     this.bufferSource = this.audioCtx!.createBufferSource()
++    const sourceSeq = ++this._scheduledSources
+     if (typeof this.option.onended === 'function') {
+       this.bufferSource.onended = () => {
++        this._endedSources += 1
+         if (!end_of_batch && index === this.samplesList.length - 1) {
+           this.ee.emit(PlayerEventTypes.Player_WaitNextAudioClip)
+         }
+-        this.option.onended()
++        this.option.onended({
++          end_of_batch,
++          source_seq: sourceSeq,
++          scheduled_sources: this._scheduledSources,
++          ended_sources: this._endedSources,
++          queue_drained: this._endedSources >= this._scheduledSources,
++        })
+       }
+     }
+     const length = data.length / this.option.channels
+diff --git a/src/renderer/src/helpers/processor.ts b/src/renderer/src/helpers/processor.ts
+index 23047e8..bd1347a 100644
+--- a/src/renderer/src/helpers/processor.ts
++++ b/src/renderer/src/helpers/processor.ts
+@@ -354,10 +354,15 @@ export class Processor {
+                 if (!option) {
+                   return
+                 }
+-                const { end_of_batch: innerEndOfBatch, lastMotionGroup: innerLastMotion } = option
++                const {
++                  end_of_batch: innerEndOfBatch,
++                  queue_drained: queueDrained,
++                  lastMotionGroup: innerLastMotion,
++                } = option
+                 console.log('innerEndOfBatch', innerEndOfBatch)
++                console.log('queueDrained', queueDrained)
+                 console.log('innerLastMotion', innerLastMotion)
+-                if (innerEndOfBatch) {
++                if (innerEndOfBatch && queueDrained) {
+                   const { batch_id, player } = innerLastMotion as IAvatarMotionGroup
+                   this.ee.emit(PlayerEventTypes.Player_EndSpeaking, player)
+                   this._motionDataGroups = this._motionDataGroups.filter(
+@@ -374,12 +379,22 @@ export class Processor {
+             this.ee
+           )
+         }
+-        console.log('end_of_batch', end_of_batch)
+-        if (end_of_batch) {
+-          const originEnded = lastMotionGroup.player!.option.onended
+-          lastMotionGroup.player!.option.onended = () => {
+-            originEnded({
+-              end_of_batch,
++      }
++      console.log('end_of_batch', end_of_batch)
++      if (end_of_batch && lastMotionGroup.player) {
++        type PlayerWithBatchEnd = Player & {
++          __oacBatchEndHookId?: number
++          __oacBaseOnEnded?: (extParams?: Record<string, unknown>) => void
++        }
++        const player = lastMotionGroup.player as PlayerWithBatchEnd
++        const batchId = Number(lastMotionGroup.batch_id ?? -1)
++        if (player.__oacBatchEndHookId !== batchId) {
++          const baseOnEnded = player.__oacBaseOnEnded ?? player.option.onended
++          player.__oacBaseOnEnded = baseOnEnded
++          player.__oacBatchEndHookId = batchId
++          player.option.onended = (extParams) => {
++            baseOnEnded({
++              ...extParams,
+               lastMotionGroup,
+             })
+           }
+diff --git a/src/renderer/src/store/media.ts b/src/renderer/src/store/media.ts
+index aba68db..dac334e 100644
+--- a/src/renderer/src/store/media.ts
++++ b/src/renderer/src/store/media.ts
+@@ -14,7 +14,13 @@ const defaultTrackConstraints = {
+     width: 500,
+     height: 500,
+   },
+-  audio: {},
++  audio: {
++    // Keep mic capture deterministic across turns; server-side VAD/AGC handles processing.
++    echoCancellation: true,
++    noiseSuppression: true,
++    autoGainControl: true,
++    channelCount: 1,
++  },
+ }
+ 
+ type TrackConstraints =
+diff --git a/src/renderer/src/store/ws.ts b/src/renderer/src/store/ws.ts
+index 4a7067a..ad51690 100644
+--- a/src/renderer/src/store/ws.ts
++++ b/src/renderer/src/store/ws.ts
+@@ -32,9 +32,15 @@ interface WSChatState {
+   audioContext: AudioContext | null
+   audioProcessor: AudioProcessorNode | null
+   audioSource: MediaStreamAudioSourceNode | null
++  audioSink: GainNode | null
+   lastSpeechId: string | null
+   localRendererAvatar: AvatarHandler | null
+   pendingAvatarAudio: PendingAvatarAudio | null
++  micPacketCount: number
++  micSampleCount: number
++  lastMicSentAt: number
++  audioMonitorTimer: number | null
++  audioRecovering: boolean
+ }
+ 
+ function floatTo16BitPCM(
+@@ -69,9 +75,15 @@ export const useWSVideoChatStore = defineStore('wsVideoChatStore', {
+     audioContext: null,
+     audioProcessor: null,
+     audioSource: null,
++    audioSink: null,
+     lastSpeechId: null,
+     localRendererAvatar: null,
+     pendingAvatarAudio: null,
++    micPacketCount: 0,
++    micSampleCount: 0,
++    lastMicSentAt: 0,
++    audioMonitorTimer: null,
++    audioRecovering: false,
+   }),
+   actions: {
+     async startSession() {
+@@ -111,6 +123,9 @@ export const useWSVideoChatStore = defineStore('wsVideoChatStore', {
+       ws.on(WsEventTypes.WS_OPEN, () => {
+         console.log('socket opened')
+         this.streamState = StreamState.open
++        this.micPacketCount = 0
++        this.micSampleCount = 0
++        this.lastMicSentAt = 0
+         this._startAudioCapture()
+       })
+       ws.on(WsEventTypes.WS_CLOSE, () => {
+@@ -135,6 +150,19 @@ export const useWSVideoChatStore = defineStore('wsVideoChatStore', {
+       this._stopAudioCapture()
+       this.audioContext = new AudioContext()
+       this.audioSource = this.audioContext.createMediaStreamSource(mediaStore.stream)
++      this.audioSink = this.audioContext.createGain()
++      this.audioSink.gain.value = 0
++      this.audioSink.connect(this.audioContext.destination)
++      this.lastMicSentAt = Date.now()
++      this.audioContext.onstatechange = () => {
++        console.log('[ws-audio] context state:', this.audioContext?.state)
++      }
++      const audioTrack = mediaStore.stream.getAudioTracks()[0]
++      if (audioTrack) {
++        audioTrack.onended = () => console.warn('[ws-audio] microphone track ended')
++        audioTrack.onmute = () => console.warn('[ws-audio] microphone track muted')
++        audioTrack.onunmute = () => console.log('[ws-audio] microphone track unmuted')
++      }
+ 
+       const startWorklet = async (): Promise<boolean> => {
+         try {
+@@ -152,7 +180,7 @@ export const useWSVideoChatStore = defineStore('wsVideoChatStore', {
+           }
+           this.audioProcessor = workletNode
+           this.audioSource?.connect(workletNode)
+-          workletNode.connect(this.audioContext!.destination)
++          workletNode.connect(this.audioSink!)
+           return true
+         } catch (error) {
+           console.warn('AudioWorklet unavailable, falling back to ScriptProcessor', error)
+@@ -160,11 +188,13 @@ export const useWSVideoChatStore = defineStore('wsVideoChatStore', {
+         }
+       }
+ 
+-      const workletStarted =
+-        this.audioContext.audioWorklet && typeof AudioWorkletNode !== 'undefined'
+-          ? await startWorklet()
+-          : false
+-      if (workletStarted) return
++      // ScriptProcessor is less efficient but has been more reliable than
++      // AudioWorklet for long-running mic capture in this deployment.
++      const workletStarted = false
++      if (workletStarted) {
++        this._startAudioMonitor()
++        return
++      }
+ 
+       const fallbackBufferSize = 2048
+       const scriptNode = this.audioContext.createScriptProcessor(fallbackBufferSize, 1, 1)
+@@ -177,9 +207,11 @@ export const useWSVideoChatStore = defineStore('wsVideoChatStore', {
+         this._sendHumanAudio(pcm)
+       }
+       this.audioSource.connect(scriptNode)
+-      scriptNode.connect(this.audioContext.destination)
++      scriptNode.connect(this.audioSink)
++      this._startAudioMonitor()
+     },
+     _stopAudioCapture() {
++      this._stopAudioMonitor()
+       this.audioProcessor?.disconnect()
+       this.audioSource?.disconnect()
+       if (this.audioContext?.state !== 'closed') {
+@@ -187,12 +219,60 @@ export const useWSVideoChatStore = defineStore('wsVideoChatStore', {
+       }
+       this.audioProcessor = null
+       this.audioSource = null
++      this.audioSink?.disconnect()
++      this.audioSink = null
+       this.audioContext = null
+     },
+     _sendHumanAudio(pcm: Int16Array) {
+       if (!this.localRendererAvatar) return
++      const now = Date.now()
++      this.micPacketCount += 1
++      this.micSampleCount += pcm.length
++      this.lastMicSentAt = now
++      if (this.micPacketCount === 1 || this.micPacketCount % 2000 === 0) {
++        console.log(
++          `[ws-audio] sent packets=${this.micPacketCount}, samples=${this.micSampleCount}, last_chunk=${pcm.length}`
++        )
++      }
+       this.localRendererAvatar.sendAudio(pcm, 'base64')
+     },
++    _startAudioMonitor() {
++      this._stopAudioMonitor()
++      this.audioMonitorTimer = window.setInterval(() => {
++        if (this.streamState !== StreamState.open) return
++        const mediaStore = useMediaStore()
++        if (mediaStore.micMuted) return
++        const now = Date.now()
++        const idleMs = this.lastMicSentAt ? now - this.lastMicSentAt : 0
++        if (this.audioContext?.state === 'suspended') {
++          console.warn('[ws-audio] context suspended, trying resume')
++          this.audioContext.resume().catch((err) => {
++            console.warn('[ws-audio] resume failed', err)
++          })
++        }
++        if (idleMs > 5000 && !this.audioRecovering) {
++          void this._restartAudioCapture(`idle_${Math.round(idleMs / 1000)}s`)
++        }
++      }, 1000)
++    },
++    _stopAudioMonitor() {
++      if (this.audioMonitorTimer !== null) {
++        window.clearInterval(this.audioMonitorTimer)
++        this.audioMonitorTimer = null
++      }
++    },
++    async _restartAudioCapture(reason: string) {
++      if (this.audioRecovering) return
++      this.audioRecovering = true
++      try {
++        console.warn(
++          `[ws-audio] restarting capture due to ${reason}; packets=${this.micPacketCount}, samples=${this.micSampleCount}`
++        )
++        await this._startAudioCapture()
++      } finally {
++        this.audioRecovering = false
++      }
++    },
+ 
+     _cleanupSession() {
+       const chatStore = useChatStore()
