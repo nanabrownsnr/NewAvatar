@@ -243,6 +243,11 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         self._opus_encoder: Optional[OpusEncoder] = None
         self._opus_decoder: Optional[OpusDecoder] = None
 
+        # Audio ingress diagnostics
+        self._audio_ingress_packets: int = 0
+        self._audio_ingress_samples: int = 0
+        self._audio_ingress_last_time: float = 0.0
+
     async def get_data(self, modality: EngineChannelType, timeout: Optional[float] = 0.1) -> Optional[ChatData]:
         """从输出队列获取数据"""
         data_queue = self.output_queues.get(modality)
@@ -671,6 +676,17 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 EngineChannelType.AUDIO,
                 audio_array
             )
+            self._audio_ingress_packets += 1
+            self._audio_ingress_samples += int(audio_array.size)
+            self._audio_ingress_last_time = time.time()
+            if self._audio_ingress_packets <= 5 or self._audio_ingress_packets % 250 == 0:
+                rms = float(np.sqrt(np.mean(np.square(audio_array.astype(np.float32) / 32767.0))))
+                rms_db = 20.0 * np.log10(max(rms, 1e-8))
+                logger.info(
+                    f"Audio ingress session={self.session_id}: packets={self._audio_ingress_packets}, "
+                    f"samples={self._audio_ingress_samples}, format={audio_format}, "
+                    f"last_chunk={audio_array.size}, rms_db={rms_db:.1f}"
+                )
 
             # logger.debug(f"Received audio stream: {audio_array.size} samples, format={audio_format}, session={self.session_id}")
         except Exception as e:
@@ -1525,6 +1541,14 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                     connection_info.quit.set()
 
                     break
+
+                if self._audio_ingress_last_time > 0:
+                    audio_idle = time.time() - self._audio_ingress_last_time
+                    if audio_idle > 8.0:
+                        logger.warning(
+                            f"Audio ingress idle session={self.session_id}: idle={audio_idle:.1f}s, "
+                            f"packets={self._audio_ingress_packets}, samples={self._audio_ingress_samples}"
+                        )
 
             except Exception as e:
                 logger.error(f"Error in heartbeat monitor: {e}")

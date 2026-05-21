@@ -75,6 +75,8 @@ class HumanAudioVADContext(HandlerContext):
 
         self.peak_volume = -100
         self.current_db: float = -100  # 当前音频的能量（dB），用于 POST_END 的备份检测
+        self._debug_log_counter: int = 0
+        self._skip_log_counter: int = 0
 
         self.speech_id: int = 0
 
@@ -432,6 +434,13 @@ class HandlerAudioVAD(HandlerBase, ABC):
         
         # POST_END 状态下需要继续处理音频进行监控，不受播放状态限制
         if not context.input_enabled and context.speaking_status != SpeakingStatus.POST_END:
+            context._skip_log_counter += 1
+            if context._skip_log_counter % 200 == 0:
+                logger.warning(
+                    f"VAD skipping mic input: session={context.session_id}, "
+                    f"input_enabled={context.input_enabled}, status={context.speaking_status.name}, "
+                    f"skip_count={context._skip_log_counter}"
+                )
             return
         if inputs.type != ChatDataType.MIC_AUDIO:
             return
@@ -445,6 +454,8 @@ class HandlerAudioVAD(HandlerBase, ABC):
 
         if context.agc is not None:
             context.agc.update_gain(audio)
+            # Apply AGC before VAD so low-input microphones can still trigger speech start.
+            audio = context.agc.apply_gain(audio)
 
         timestamp = None
         if inputs.is_timestamp_valid():
@@ -466,6 +477,14 @@ class HandlerAudioVAD(HandlerBase, ABC):
             if (context.speaking_status in (SpeakingStatus.END, SpeakingStatus.POST_END)
                 and db < context.config.volume_threshold):
                 speech_prob = 0.0
+            if context.speaking_status == SpeakingStatus.END:
+                context._debug_log_counter += 1
+                if context._debug_log_counter % 80 == 0:
+                    logger.info(
+                        f"VAD END monitor: session={context.session_id}, "
+                        f"speech_prob={speech_prob:.3f}, threshold={context.config.speaking_threshold:.3f}, "
+                        f"db={db:.1f}, input_enabled={context.input_enabled}"
+                    )
             # logger.info(f"RMS: {rms}, CurrentDB: {db} dB, PeakVolume: {context.peak_volume} dB, "
             #             f"VAD prob {speech_prob:.2f}: {'='*int(speech_prob * 20)}")
             if context.peak_volume > -100:
@@ -498,18 +517,17 @@ class HandlerAudioVAD(HandlerBase, ABC):
             # 处理 POST_END 超时：确认判停正确
             if post_end_timeout:
                 logger.info("POST_END timeout, clearing reconnection buffers")
+                # Start the next turn from a clean VAD/model state.
+                context.reset()
+                context.reset_model()
             
             if human_speech_end:
-                # In simplex mode, VAD self-disables after speech end.
-                # It will be re-enabled by CLIENT_PLAYBACK STREAM_END when avatar finishes playing.
-                context.input_enabled = False
+                # Keep VAD enabled for multi-turn chat even if CLIENT_PLAYBACK end signal is missing.
+                context.input_enabled = True
             if back_to_end or (human_speech_end and not entering_post_end):
                 context.reset()
                 context.reset_model()
             if audio_clip is not None:
-                if context.agc is not None:
-                    audio_clip = context.agc.apply_gain(audio_clip)
-                
                 # 在 START 状态时保存音频到缓冲（用于可能的重连）
                 if context.speaking_status == SpeakingStatus.START or entering_post_end:
                     context.current_stream_audio.append(audio_clip.copy())
@@ -601,8 +619,9 @@ class HandlerAudioVAD(HandlerBase, ABC):
             context.input_enabled = True
             logger.debug(f"VAD input enabled by CLIENT_PLAYBACK {signal.type.value} from {signal.source_name}")
         elif is_playback_stream and signal.type == ChatSignalType.STREAM_BEGIN:
-            context.input_enabled = False
-            logger.debug(f"VAD input disabled by CLIENT_PLAYBACK STREAM_BEGIN from {signal.source_name}")
+            # Do not pause microphone capture on playback in this deployment mode.
+            context.input_enabled = True
+            logger.debug(f"VAD input remains enabled on CLIENT_PLAYBACK STREAM_BEGIN from {signal.source_name}")
         elif signal.type == ChatSignalType.STREAM_END and not is_playback_stream and signal.is_candidate:
             # 收到来自其他 handler 的候选结束信号
             if (signal.related_stream and 

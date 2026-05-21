@@ -140,8 +140,17 @@ class HandlerASR(HandlerBase, ABC):
         res = self.model.generate(input=output_audio, batch_size_s=10)
         logger.info(res)
         context.output_audios.clear()
-        output_text = re.sub(r"<\|.*?\|>", "", res[0]['text'])
-        if len(output_text) == 0:
+        raw_text = res[0]['text'] if isinstance(res, list) and res else ""
+        output_text = re.sub(r"<\|.*?\|>", "", raw_text).strip()
+        # Drop tiny/noise transcripts to avoid accidental turn triggers from playback bleed.
+        compact = re.sub(r"\s+", "", output_text)
+        if len(compact) == 0:
+            return
+        if len(compact) < 2:
+            logger.info(f"ASR drop short transcript: '{output_text}'")
+            return
+        if "<|nospeech|>" in raw_text and len(compact) < 6:
+            logger.info(f"ASR drop nospeech-like transcript: '{output_text}'")
             return
         output = DataBundle(output_definition)
         output.set_main_data(output_text)

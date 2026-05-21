@@ -3,12 +3,12 @@ default:
     log_level: "INFO"
   service:
     host: "0.0.0.0"
-    port: 8282
+    port: 8040
     cert_file: "ssl_certs/localhost.crt"
     cert_key: "ssl_certs/localhost.key"
   chat_engine:
     model_root: "models"
-    concurrent_limit: 2
+    concurrent_limit: 1
     handler_search_path:
       - "src/handlers"
     handler_configs:
@@ -16,6 +16,14 @@ default:
         module: client/rtc_client/client_handler_rtc
         # max time a session will last for
         connection_ttl: 900
+        turn_config:
+          turn_provider: "turn_server"
+          urls:
+            - "stun:178.194.34.219:3478"
+            - "turn:178.194.34.219:3478?transport=udp"
+            - "turn:178.194.34.219:3478?transport=tcp"
+          username: "twynbook"
+          credential: "twynbook"
       # === 打断处理器 - 接收 INTERRUPT 信号并执行流取消 ===
       InterruptHandler:
         module: logic/interrupt/interrupt_handler

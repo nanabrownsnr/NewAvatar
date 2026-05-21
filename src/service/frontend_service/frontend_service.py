@@ -77,13 +77,22 @@ def register_frontend(
     if frontend_path.exists():
         logger.info(f"Serving frontend from {frontend_path}")
         app.mount(opts.mount_path, StaticFiles(directory=frontend_path), name="static")
-        app.add_route(opts.root_route, RedirectResponse(url=opts.redirect_target))
+
+        @app.get(opts.root_route, include_in_schema=False)
+        async def root_redirect():
+            return RedirectResponse(url=opts.redirect_target)
+
+        @app.get(f"{opts.mount_path}/", include_in_schema=False)
+        async def ui_redirect():
+            return RedirectResponse(url=opts.redirect_target)
     else:
         logger.warning(f"Frontend directory {frontend_path} does not exist")
-        app.add_route(opts.root_route, RedirectResponse(url="/gradio"))
+
+        @app.get(opts.root_route, include_in_schema=False)
+        async def root_redirect():
+            return RedirectResponse(url="/gradio")
 
     active_parent = parent_block or ui
     with ui:
         with active_parent:
             gradio.components.HTML(opts.gradio_placeholder_html, visible=True)
-

@@ -44,6 +44,7 @@ class HandlerTTS(HandlerBase, ABC):
         self.voice = None
         self.ref_audio_buffer = None
         self.sample_rate = None
+        self.fallback_cn_voice = "zh-CN-XiaoxiaoNeural"
       
 
     def get_handler_info(self) -> HandlerBaseInfo:
@@ -98,6 +99,12 @@ class HandlerTTS(HandlerBase, ABC):
         filtered_text = re.sub(pattern, "", text)
         return filtered_text
 
+    def _pick_voice(self, text: str) -> str:
+        # Edge TTS can hang when forcing some English voices on CJK content.
+        if re.search(r"[\u4e00-\u9fff]", text):
+            return self.fallback_cn_voice
+        return self.voice
+
     def handle(self, context: HandlerContext, inputs: ChatData,
                output_definitions: Dict[ChatDataType, HandlerDataInfo]):
         output_definition = output_definitions.get(ChatDataType.AVATAR_AUDIO).definition
@@ -112,7 +119,9 @@ class HandlerTTS(HandlerBase, ABC):
 
         text_end = inputs.data.get_meta("avatar_text_end", False)
         if not text_end:
-            sentences = re.split(r'(?<=[,.~!?，。！？])', context.input_text)
+            # Do not split on commas; early comma chunks can stall TTS streaming and
+            # create partial/cut responses.
+            sentences = re.split(r'(?<=[.!?。！？])', context.input_text)
             if len(sentences) > 1:  # 至少有一个完整句子
                 complete_sentences = sentences[:-1]  # 完整句子
                 context.input_text = sentences[-1]  # 剩余的未完成部分
@@ -122,35 +131,46 @@ class HandlerTTS(HandlerBase, ABC):
                     if len(sentence.strip()) < 1:
                         continue
                     logger.info('current sentence' + sentence)
-                    
-                    communicate = edge_tts.Communicate(sentence, self.voice)
-                    data = b''
 
-                    for chunk in communicate.stream_sync():
-                        if chunk['type'] == 'audio':
-                            # tts_audio = chunk['data']
-                            data += chunk['data']
-                    
-                    output_audio = librosa.load(io.BytesIO(data), sr=None)[0]
-                    output_audio = output_audio[np.newaxis, ...]
-                    output = DataBundle(output_definition)
-                    output.set_main_data(output_audio)
-                    context.submit_data(output)
+                    try:
+                        voice = self._pick_voice(sentence)
+                        logger.info(f"TTS voice={voice} sentence={sentence}")
+                        communicate = edge_tts.Communicate(sentence, voice)
+                        data = b''
+                        for chunk in communicate.stream_sync():
+                            if chunk['type'] == 'audio':
+                                data += chunk['data']
+                        if len(data) == 0:
+                            logger.warning(f"TTS empty audio for sentence: {sentence}")
+                            continue
+                        output_audio = librosa.load(io.BytesIO(data), sr=None)[0]
+                        output_audio = output_audio[np.newaxis, ...]
+                        output = DataBundle(output_definition)
+                        output.set_main_data(output_audio)
+                        context.submit_data(output)
+                    except Exception as e:
+                        logger.error(f"TTS sentence failed: {e}")
         else:
             logger.info('last sentence' + context.input_text)
             if context.input_text is not None and len(context.input_text.strip()) > 0:
-                    communicate = edge_tts.Communicate(context.input_text, self.voice)
+                try:
+                    voice = self._pick_voice(context.input_text)
+                    logger.info(f"TTS voice={voice} sentence={context.input_text}")
+                    communicate = edge_tts.Communicate(context.input_text, voice)
                     data = b''
-
                     for chunk in communicate.stream_sync():
                         if chunk['type'] == 'audio':
-                            # tts_audio = chunk['data']
                             data += chunk['data']
-                    output_audio = librosa.load(io.BytesIO(data), sr=None)[0]
-                    output_audio = output_audio[np.newaxis, ...]
-                    output = DataBundle(output_definition)
-                    output.set_main_data(output_audio)
-                    context.submit_data(output)
+                    if len(data) > 0:
+                        output_audio = librosa.load(io.BytesIO(data), sr=None)[0]
+                        output_audio = output_audio[np.newaxis, ...]
+                        output = DataBundle(output_definition)
+                        output.set_main_data(output_audio)
+                        context.submit_data(output)
+                    else:
+                        logger.warning(f"TTS empty audio for last sentence: {context.input_text}")
+                except Exception as e:
+                    logger.error(f"TTS last sentence failed: {e}")
             context.input_text = ''
             output = DataBundle(output_definition)
             output.set_main_data(np.zeros(shape=(1, 240), dtype=np.float32))
@@ -160,4 +180,3 @@ class HandlerTTS(HandlerBase, ABC):
     def destroy_context(self, context: HandlerContext):
         context = cast(TTSContext, context)
         logger.info('destroy context')
-

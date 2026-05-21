@@ -103,6 +103,8 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, exiting.")
+    except Exception:
+        logger.exception("Unhandled exception during startup/runtime.")
     finally:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
